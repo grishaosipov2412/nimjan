@@ -1,0 +1,4 @@
+﻿Method,Path,Description
+GET,/health,Health check
+GET,/v1/models,List models
+POST,/v1/chat/completions,Chat completions

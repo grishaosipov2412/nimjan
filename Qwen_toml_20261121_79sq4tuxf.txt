@@ -1,0 +1,8 @@
+name = "nim-proxy"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+[vars]
+# Эти переменные можно задать здесь или через Cloudflare Dashboard
+# BACKEND_API_KEY = "nvapi-..."
+# CLIENT_API_KEY = "sk-..."
