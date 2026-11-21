@@ -1,8 +1,7 @@
 export default {
   async fetch(request, env) {
-    // ВРЕМЕННЫЙ ТЕСТ: если переменные из дашборда не читаются, используем хардкод
-    const BACKEND_API_KEY = env.BACKEND_API_KEY || "nvapi-ТВОЙ_РЕАЛЬНЫЙ_КЛЮЧ_NVIDIA";
-    const CLIENT_API_KEY = env.CLIENT_API_KEY || "123456789";
+    const BACKEND_API_KEY = env.BACKEND_API_KEY;
+    const CLIENT_API_KEY = env.CLIENT_API_KEY;
     const API_BASE = "https://integrate.api.nvidia.com/v1";
     const url = new URL(request.url);
     
@@ -23,16 +22,38 @@ export default {
 
     // 2. Health check (без ключа)
     if (pathname === "/health" && request.method === "GET") {
+      const hasBackendKey = !!BACKEND_API_KEY;
+      const hasClientKey = !!CLIENT_API_KEY;
+      
       return new Response(JSON.stringify({
         status: "ok",
         service: "CF Worker Proxy",
-        supported_efforts: ["minimal", "low", "medium", "high", "extra-high", "max"]
+        supported_efforts: ["minimal", "low", "medium", "high", "extra-high", "max"],
+        config: {
+          BACKEND_API_KEY_set: hasBackendKey,
+          CLIENT_API_KEY_set: hasClientKey
+        }
       }), {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
       });
     }
 
-    // 3. Проверка ключа клиента
+    // 3. Проверка наличия переменных окружения
+    if (!BACKEND_API_KEY || !CLIENT_API_KEY) {
+      return new Response(JSON.stringify({
+        error: "Server configuration error",
+        details: {
+          BACKEND_API_KEY: BACKEND_API_KEY ? "✓ set" : "✗ MISSING",
+          CLIENT_API_KEY: CLIENT_API_KEY ? "✓ set" : "✗ MISSING"
+        },
+        fix: "Add both variables in Cloudflare Dashboard → Workers & Pages → nimjan → Settings → Variables and secrets"
+      }), {
+        status: 500,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
+    }
+
+    // 4. Проверка ключа клиента
     const authHeader = request.headers.get("Authorization");
     if (!authHeader || authHeader !== `Bearer ${CLIENT_API_KEY}`) {
       return new Response(JSON.stringify({ error: "Invalid API key" }), {
@@ -40,7 +61,7 @@ export default {
       });
     }
 
-    // 4. Models endpoint
+    // 5. Models endpoint
     if (pathname === "/v1/models" && request.method === "GET") {
       return new Response(JSON.stringify({
         object: "list",
@@ -48,7 +69,7 @@ export default {
       }), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
     }
 
-    // 5. Chat completions
+    // 6. Chat completions
     if (pathname === "/v1/chat/completions" && request.method === "POST") {
       let body;
       try {
@@ -111,7 +132,7 @@ export default {
       }
     }
 
-    // 6. 404 для всего остального
+    // 7. 404 для всего остального
     return new Response(JSON.stringify({ error: "Not Found: " + pathname }), {
       status: 404, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
     });
