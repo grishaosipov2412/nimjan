@@ -5,7 +5,6 @@ export default {
     const API_BASE = "https://integrate.api.nvidia.com/v1";
     const url = new URL(request.url);
     
-    // Убираем возможный слэш в конце пути
     const pathname = url.pathname.replace(/\/$/, ""); 
 
     // 1. CORS preflight
@@ -22,16 +21,13 @@ export default {
 
     // 2. Health check (без ключа)
     if (pathname === "/health" && request.method === "GET") {
-      const hasBackendKey = !!BACKEND_API_KEY;
-      const hasClientKey = !!CLIENT_API_KEY;
-      
       return new Response(JSON.stringify({
         status: "ok",
         service: "CF Worker Proxy",
         supported_efforts: ["minimal", "low", "medium", "high", "extra-high", "max"],
         config: {
-          BACKEND_API_KEY_set: hasBackendKey,
-          CLIENT_API_KEY_set: hasClientKey
+          BACKEND_API_KEY_set: !!BACKEND_API_KEY,
+          CLIENT_API_KEY_set: !!CLIENT_API_KEY
         }
       }), {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
@@ -45,8 +41,7 @@ export default {
         details: {
           BACKEND_API_KEY: BACKEND_API_KEY ? "✓ set" : "✗ MISSING",
           CLIENT_API_KEY: CLIENT_API_KEY ? "✓ set" : "✗ MISSING"
-        },
-        fix: "Add both variables in Cloudflare Dashboard → Workers & Pages → nimjan → Settings → Variables and secrets"
+        }
       }), {
         status: 500,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
@@ -86,6 +81,7 @@ export default {
         });
       }
 
+      // Формируем запрос к NVIDIA БЕЗ extra_body
       const nimRequest = {
         model: body.model,
         messages: body.messages || [],
@@ -94,10 +90,13 @@ export default {
         stream: body.stream || false,
       };
 
+      // Если клиент просит thinking, добавляем параметры напрямую (не через extra_body)
       if (body.thinking || body.reasoning_effort) {
         const effort = body.reasoning_effort || "medium";
         if (!["off", "none", "disabled"].includes(String(effort).toLowerCase())) {
-          nimRequest.extra_body = { chat_template_kwargs: { thinking: true, reasoning_effort: effort } };
+          // Передаём напрямую в тело запроса
+          nimRequest.thinking = true;
+          nimRequest.reasoning_effort = effort;
         }
       }
 
