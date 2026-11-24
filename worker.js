@@ -59,19 +59,36 @@ export default {
         });
       }
 
-      // 🔥 УВЕЛИЧЕННЫЙ ТАЙМАУТ для больших моделей
-      const timeout = body.model.includes("120b") || body.model.includes("405b") ? 180000 : 120000; // 3 минуты для больших моделей
+      // 🔥 Автоконвертация формата для VL-моделей
+      // Nemotron VL требует массив content: [{type: "text", text: "..."}]
+      // Janitor AI отправляет просто строку. Конвертируем автоматически.
+      const isVLModel = /vl|vision|multimodal/i.test(body.model);
+      let processedMessages = body.messages;
+      
+      if (isVLModel) {
+        processedMessages = body.messages.map(msg => {
+          // Если content — строка, конвертируем в массив
+          if (typeof msg.content === "string") {
+            return { ...msg, content: [{ type: "text", text: msg.content }] };
+          }
+          // Если content — массив, оставляем как есть
+          return msg;
+        });
+      }
 
-      // Формируем запрос к NVIDIA
+      // 🔥 Увеличенный таймаут для больших моделей
+      const isLargeModel = /120b|405b|70b/i.test(body.model);
+      const timeout = isLargeModel ? 180000 : 120000; // 3 мин для больших, 2 мин для остальных
+
       const nimRequest = {
         model: body.model,
-        messages: body.messages,
+        messages: processedMessages,
         temperature: body.temperature !== undefined ? body.temperature : 0.7,
-        max_tokens: body.max_tokens || 2048, // Уменьшено для ускорения
-        stream: body.stream !== undefined ? body.stream : true,
+        max_tokens: body.max_tokens || 1024, // Меньше = быстрее
+        stream: true, // Всегда стриминг для избежания таймаутов
       };
 
-      // Добавляем thinking если нужно
+      // Thinking
       if (body.thinking || body.reasoning_effort) {
         const effort = body.reasoning_effort || "medium";
         if (!["off", "none", "disabled"].includes(String(effort).toLowerCase())) {
@@ -81,7 +98,6 @@ export default {
       }
 
       try {
-        // Используем AbortController для таймаута
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), timeout);
 
@@ -97,6 +113,13 @@ export default {
 
         clearTimeout(timeoutId);
 
+        const streamHeaders = {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+          "Access-Control-Allow-Origin": "*",
+        };
+
         // Обработка ошибок от NVIDIA
         if (!response.ok) {
           const errorText = await response.text();
@@ -106,73 +129,34 @@ export default {
           } catch (e) {
             errorData = { error: { message: errorText.substring(0, 500) } };
           }
-          
-          // Если клиент просил стриминг, возвращаем ошибку в SSE-формате
-          if (body.stream) {
-            const errorSSE = `data: ${JSON.stringify(errorData)}\n\ndata: [DONE]\n\n`;
-            return new Response(errorSSE, {
-              status: response.status,
-              headers: {
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "Access-Control-Allow-Origin": "*"
-              }
-            });
-          }
-          
-          return new Response(JSON.stringify(errorData), {
+          // Janitor AI ожидает SSE с [DONE] в конце
+          const errorSSE = `data: ${JSON.stringify(errorData)}\n\ndata: [DONE]\n\n`;
+          return new Response(errorSSE, {
             status: response.status,
-            headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+            headers: streamHeaders
           });
         }
 
-        // Если клиент просил стриминг - пробрасываем поток напрямую
-        if (body.stream) {
-          return new Response(response.body, {
-            status: 200,
-            headers: {
-              "Content-Type": "text/event-stream",
-              "Cache-Control": "no-cache",
-              "Connection": "keep-alive",
-              "Access-Control-Allow-Origin": "*",
-            },
-          });
-        }
-
-        // Обычный JSON-ответ
-        const data = await response.json();
-        return new Response(JSON.stringify(data), {
+        // 🔥 Пробрасываем стрим как есть — без парсинга
+        // Это гарантирует, что Janitor AI получит правильный формат
+        return new Response(response.body, {
           status: 200,
-          headers: {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*"
-          }
+          headers: streamHeaders,
         });
         
       } catch (err) {
+        const isTimeout = err.name === 'AbortError';
         const errorResponse = { 
           error: { 
-            message: err.name === 'AbortError' 
-              ? `Request timed out after ${timeout/1000}s. Model ${body.model} is too slow. Try a smaller model or reduce max_tokens.`
-              : "Network error to upstream: " + err.message 
+            message: isTimeout 
+              ? `Model ${body.model} timed out after ${timeout/1000}s. Try reducing max_tokens or use a smaller model.`
+              : "Network error: " + err.message 
           } 
         };
-        
-        if (body.stream) {
-          const errorSSE = `data: ${JSON.stringify(errorResponse)}\n\ndata: [DONE]\n\n`;
-          return new Response(errorSSE, {
-            status: err.name === 'AbortError' ? 504 : 502,
-            headers: {
-              "Content-Type": "text/event-stream",
-              "Cache-Control": "no-cache",
-              "Access-Control-Allow-Origin": "*"
-            }
-          });
-        }
-        
-        return new Response(JSON.stringify(errorResponse), {
-          status: err.name === 'AbortError' ? 504 : 502,
-          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        const errorSSE = `data: ${JSON.stringify(errorResponse)}\n\ndata: [DONE]\n\n`;
+        return new Response(errorSSE, {
+          status: isTimeout ? 504 : 502,
+          headers: streamHeaders
         });
       }
     }
