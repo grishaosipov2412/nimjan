@@ -59,16 +59,15 @@ export default {
         });
       }
 
-      // 🔥 ВСЕГДА запрашиваем у NVIDIA stream: false, чтобы получить обычный JSON
+      // Всегда запрашиваем у NVIDIA stream: false для надёжности
       const nimRequest = {
         model: body.model,
         messages: body.messages,
         temperature: body.temperature !== undefined ? body.temperature : 0.7,
         max_tokens: body.max_tokens || 1024,
-        stream: false, // Всегда false для надёжности
+        stream: false,
       };
 
-      // Если клиент просит thinking, добавляем параметры
       if (body.thinking || body.reasoning_effort) {
         const effort = body.reasoning_effort || "medium";
         if (!["off", "none", "disabled"].includes(String(effort).toLowerCase())) {
@@ -96,16 +95,55 @@ export default {
           } catch (e) {
             errorData = { error: { message: errorText.substring(0, 300) } };
           }
+          
+          // Если клиент просил стриминг, возвращаем ошибку в SSE-формате
+          if (body.stream) {
+            const errorSSE = `data: ${JSON.stringify(errorData)}\n\ndata: [DONE]\n\n`;
+            return new Response(errorSSE, {
+              status: response.status,
+              headers: {
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Access-Control-Allow-Origin": "*"
+              }
+            });
+          }
+          
           return new Response(JSON.stringify(errorData), {
             status: response.status,
             headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
           });
         }
 
-        // Получаем обычный JSON от NVIDIA
         const data = await response.json();
 
-        // Возвращаем клиенту как есть (даже если клиент просил стриминг)
+        // Если клиент просил стриминг - конвертируем в SSE-формат
+        if (body.stream) {
+          const content = data.choices?.[0]?.message?.content || '';
+          const chunk = {
+            id: data.id,
+            object: "chat.completion.chunk",
+            created: data.created,
+            model: data.model,
+            choices: [{
+              index: 0,
+              delta: { content: content },
+              finish_reason: "stop"
+            }]
+          };
+          const sseResponse = `data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`;
+          
+          return new Response(sseResponse, {
+            status: 200,
+            headers: {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              "Access-Control-Allow-Origin": "*"
+            }
+          });
+        }
+
+        // Обычный JSON-ответ
         return new Response(JSON.stringify(data), {
           status: 200,
           headers: {
@@ -115,7 +153,21 @@ export default {
         });
         
       } catch (err) {
-        return new Response(JSON.stringify({ error: "Network error to upstream: " + err.message }), {
+        const errorResponse = { error: "Network error to upstream: " + err.message };
+        
+        if (body.stream) {
+          const errorSSE = `data: ${JSON.stringify(errorResponse)}\n\ndata: [DONE]\n\n`;
+          return new Response(errorSSE, {
+            status: 502,
+            headers: {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              "Access-Control-Allow-Origin": "*"
+            }
+          });
+        }
+        
+        return new Response(JSON.stringify(errorResponse), {
           status: 502, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
         });
       }
