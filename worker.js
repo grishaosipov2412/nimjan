@@ -59,36 +59,29 @@ export default {
         });
       }
 
-      // 🔥 Автоконвертация формата для VL-моделей
-      // Nemotron VL требует массив content: [{type: "text", text: "..."}]
-      // Janitor AI отправляет просто строку. Конвертируем автоматически.
+      // Автоконвертация для VL-моделей
       const isVLModel = /vl|vision|multimodal/i.test(body.model);
       let processedMessages = body.messages;
-      
       if (isVLModel) {
         processedMessages = body.messages.map(msg => {
-          // Если content — строка, конвертируем в массив
           if (typeof msg.content === "string") {
             return { ...msg, content: [{ type: "text", text: msg.content }] };
           }
-          // Если content — массив, оставляем как есть
           return msg;
         });
       }
 
-      // 🔥 Увеличенный таймаут для больших моделей
       const isLargeModel = /120b|405b|70b/i.test(body.model);
-      const timeout = isLargeModel ? 180000 : 120000; // 3 мин для больших, 2 мин для остальных
+      const timeout = isLargeModel ? 180000 : 120000;
 
       const nimRequest = {
         model: body.model,
         messages: processedMessages,
         temperature: body.temperature !== undefined ? body.temperature : 0.7,
-        max_tokens: body.max_tokens || 1024, // Меньше = быстрее
-        stream: true, // Всегда стриминг для избежания таймаутов
+        max_tokens: body.max_tokens || 1024,
+        stream: true,
       };
 
-      // Thinking
       if (body.thinking || body.reasoning_effort) {
         const effort = body.reasoning_effort || "medium";
         if (!["off", "none", "disabled"].includes(String(effort).toLowerCase())) {
@@ -120,7 +113,7 @@ export default {
           "Access-Control-Allow-Origin": "*",
         };
 
-        // Обработка ошибок от NVIDIA
+        // Обработка ошибок
         if (!response.ok) {
           const errorText = await response.text();
           let errorData;
@@ -129,19 +122,90 @@ export default {
           } catch (e) {
             errorData = { error: { message: errorText.substring(0, 500) } };
           }
-          // Janitor AI ожидает SSE с [DONE] в конце
           const errorSSE = `data: ${JSON.stringify(errorData)}\n\ndata: [DONE]\n\n`;
-          return new Response(errorSSE, {
-            status: response.status,
-            headers: streamHeaders
+          return new Response(errorSSE, { status: response.status, headers: streamHeaders });
+        }
+
+        // 🔥 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: читаем поток, парсим каждый чанк,
+        // копируем reasoning_content -> content, отправляем дальше.
+        if (body.stream) {
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          const encoder = new TextEncoder();
+          let buffer = "";
+
+          const stream = new ReadableStream({
+            async start(controller) {
+              try {
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) {
+                    // Отправляем финальный [DONE]
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                    break;
+                  }
+
+                  buffer += decoder.decode(value, { stream: true });
+                  
+                  // Обрабатываем все полные SSE-сообщения в буфере
+                  let newlineIndex;
+                  while ((newlineIndex = buffer.indexOf("\n\n")) !== -1) {
+                    const message = buffer.slice(0, newlineIndex).trim();
+                    buffer = buffer.slice(newlineIndex + 2);
+
+                    if (!message || message.startsWith(":")) continue; // комментарии SSE
+
+                    if (message.startsWith("data: ")) {
+                      const dataStr = message.slice(6).trim();
+                      
+                      if (dataStr === "[DONE]") {
+                        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                        continue;
+                      }
+
+                      try {
+                        const chunk = JSON.parse(dataStr);
+                        
+                        // 🔥 Переносим reasoning_content в content для Janitor AI
+                        if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta) {
+                          const delta = chunk.choices[0].delta;
+                          if (delta.reasoning_content) {
+                            // Копируем reasoning в content (Janitor AI ждёт именно content)
+                            delta.content = delta.reasoning_content;
+                            // Можно удалить reasoning_content, чтобы не дублировать
+                            delete delta.reasoning_content;
+                          }
+                        }
+
+                        // Отправляем обработанный чанк
+                        controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                      } catch (e) {
+                        // Если не JSON — отправляем как есть
+                        controller.enqueue(encoder.encode(`${message}\n\n`));
+                      }
+                    } else {
+                      controller.enqueue(encoder.encode(`${message}\n\n`));
+                    }
+                  }
+                }
+              } catch (err) {
+                controller.error(err);
+              }
+            }
+          });
+
+          return new Response(stream, {
+            status: 200,
+            headers: streamHeaders,
           });
         }
 
-        // 🔥 Пробрасываем стрим как есть — без парсинга
-        // Это гарантирует, что Janitor AI получит правильный формат
-        return new Response(response.body, {
+        // Не-стриминг (на всякий случай)
+        const data = await response.json();
+        return new Response(JSON.stringify(data), {
           status: 200,
-          headers: streamHeaders,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
         });
         
       } catch (err) {
@@ -149,7 +213,7 @@ export default {
         const errorResponse = { 
           error: { 
             message: isTimeout 
-              ? `Model ${body.model} timed out after ${timeout/1000}s. Try reducing max_tokens or use a smaller model.`
+              ? `Model ${body.model} timed out after ${timeout/1000}s.`
               : "Network error: " + err.message 
           } 
         };
