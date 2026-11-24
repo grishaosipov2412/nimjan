@@ -59,15 +59,19 @@ export default {
         });
       }
 
-      // Всегда запрашиваем у NVIDIA stream: false для надёжности
+      // 🔥 УВЕЛИЧЕННЫЙ ТАЙМАУТ для больших моделей
+      const timeout = body.model.includes("120b") || body.model.includes("405b") ? 180000 : 120000; // 3 минуты для больших моделей
+
+      // Формируем запрос к NVIDIA
       const nimRequest = {
         model: body.model,
         messages: body.messages,
         temperature: body.temperature !== undefined ? body.temperature : 0.7,
-        max_tokens: body.max_tokens || 1024,
-        stream: false,
+        max_tokens: body.max_tokens || 2048, // Уменьшено для ускорения
+        stream: body.stream !== undefined ? body.stream : true,
       };
 
+      // Добавляем thinking если нужно
       if (body.thinking || body.reasoning_effort) {
         const effort = body.reasoning_effort || "medium";
         if (!["off", "none", "disabled"].includes(String(effort).toLowerCase())) {
@@ -77,6 +81,10 @@ export default {
       }
 
       try {
+        // Используем AbortController для таймаута
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeout);
+
         const response = await fetch(`${API_BASE}/chat/completions`, {
           method: "POST",
           headers: {
@@ -84,7 +92,10 @@ export default {
             "Content-Type": "application/json"
           },
           body: JSON.stringify(nimRequest),
+          signal: controller.signal,
         });
+
+        clearTimeout(timeoutId);
 
         // Обработка ошибок от NVIDIA
         if (!response.ok) {
@@ -93,7 +104,7 @@ export default {
           try {
             errorData = JSON.parse(errorText);
           } catch (e) {
-            errorData = { error: { message: errorText.substring(0, 300) } };
+            errorData = { error: { message: errorText.substring(0, 500) } };
           }
           
           // Если клиент просил стриминг, возвращаем ошибку в SSE-формате
@@ -115,35 +126,21 @@ export default {
           });
         }
 
-        const data = await response.json();
-
-        // Если клиент просил стриминг - конвертируем в SSE-формат
+        // Если клиент просил стриминг - пробрасываем поток напрямую
         if (body.stream) {
-          const content = data.choices?.[0]?.message?.content || '';
-          const chunk = {
-            id: data.id,
-            object: "chat.completion.chunk",
-            created: data.created,
-            model: data.model,
-            choices: [{
-              index: 0,
-              delta: { content: content },
-              finish_reason: "stop"
-            }]
-          };
-          const sseResponse = `data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`;
-          
-          return new Response(sseResponse, {
+          return new Response(response.body, {
             status: 200,
             headers: {
               "Content-Type": "text/event-stream",
               "Cache-Control": "no-cache",
-              "Access-Control-Allow-Origin": "*"
-            }
+              "Connection": "keep-alive",
+              "Access-Control-Allow-Origin": "*",
+            },
           });
         }
 
         // Обычный JSON-ответ
+        const data = await response.json();
         return new Response(JSON.stringify(data), {
           status: 200,
           headers: {
@@ -153,12 +150,18 @@ export default {
         });
         
       } catch (err) {
-        const errorResponse = { error: "Network error to upstream: " + err.message };
+        const errorResponse = { 
+          error: { 
+            message: err.name === 'AbortError' 
+              ? `Request timed out after ${timeout/1000}s. Model ${body.model} is too slow. Try a smaller model or reduce max_tokens.`
+              : "Network error to upstream: " + err.message 
+          } 
+        };
         
         if (body.stream) {
           const errorSSE = `data: ${JSON.stringify(errorResponse)}\n\ndata: [DONE]\n\n`;
           return new Response(errorSSE, {
-            status: 502,
+            status: err.name === 'AbortError' ? 504 : 502,
             headers: {
               "Content-Type": "text/event-stream",
               "Cache-Control": "no-cache",
@@ -168,7 +171,8 @@ export default {
         }
         
         return new Response(JSON.stringify(errorResponse), {
-          status: 502, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+          status: err.name === 'AbortError' ? 504 : 502,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
         });
       }
     }
