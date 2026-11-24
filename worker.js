@@ -4,47 +4,33 @@ export default {
     const CLIENT_API_KEY = env.CLIENT_API_KEY;
     const API_BASE = "https://integrate.api.nvidia.com/v1";
     const url = new URL(request.url);
-    
     const pathname = url.pathname.replace(/\/$/, ""); 
 
-    // 1. CORS preflight
+    // 1. CORS
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
         headers: {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Authorization, Content-Type",
+          "Access-Control-Allow-Headers": "Authorization, Content-Type, x-st-override",
         },
       });
     }
 
-    // 2. Health check (без ключа)
+    // 2. Health check
     if (pathname === "/health" && request.method === "GET") {
       return new Response(JSON.stringify({
         status: "ok",
         service: "CF Worker Proxy",
-        supported_efforts: ["minimal", "low", "medium", "high", "extra-high", "max"],
-        config: {
-          BACKEND_API_KEY_set: !!BACKEND_API_KEY,
-          CLIENT_API_KEY_set: !!CLIENT_API_KEY
-        }
-      }), {
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-      });
+        config: { BACKEND_API_KEY_set: !!BACKEND_API_KEY, CLIENT_API_KEY_set: !!CLIENT_API_KEY }
+      }), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
     }
 
-    // 3. Проверка наличия переменных окружения
+    // 3. Проверка ключей
     if (!BACKEND_API_KEY || !CLIENT_API_KEY) {
-      return new Response(JSON.stringify({
-        error: "Server configuration error",
-        details: {
-          BACKEND_API_KEY: BACKEND_API_KEY ? "✓ set" : "✗ MISSING",
-          CLIENT_API_KEY: CLIENT_API_KEY ? "✓ set" : "✗ MISSING"
-        }
-      }), {
-        status: 500,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      return new Response(JSON.stringify({ error: "Server config error: Keys missing in Cloudflare Variables" }), {
+        status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
       });
     }
 
@@ -56,15 +42,7 @@ export default {
       });
     }
 
-    // 5. Models endpoint
-    if (pathname === "/v1/models" && request.method === "GET") {
-      return new Response(JSON.stringify({
-        object: "list",
-        data: [{ id: "custom-model", object: "model", created: Math.floor(Date.now()/1000), owned_by: "proxy" }]
-      }), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
-    }
-
-    // 6. Chat completions
+    // 5. Chat completions
     if (pathname === "/v1/chat/completions" && request.method === "POST") {
       let body;
       try {
@@ -75,30 +53,19 @@ export default {
         });
       }
 
-      if (!body.model) {
-        return new Response(JSON.stringify({ error: "Parameter 'model' is required" }), {
+      if (!body.model || !body.messages || body.messages.length === 0) {
+        return new Response(JSON.stringify({ error: "Parameter 'model' and non-empty 'messages' are required" }), {
           status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
         });
       }
 
-      // Формируем запрос к NVIDIA БЕЗ extra_body
       const nimRequest = {
         model: body.model,
-        messages: body.messages || [],
-        temperature: body.temperature !== undefined ? body.temperature : 0.6,
-        max_tokens: body.max_tokens || 4096,
-        stream: body.stream || false,
+        messages: body.messages,
+        temperature: body.temperature !== undefined ? body.temperature : 0.7,
+        max_tokens: body.max_tokens || 1024,
+        stream: body.stream !== undefined ? body.stream : true,
       };
-
-      // Если клиент просит thinking, добавляем параметры напрямую (не через extra_body)
-      if (body.thinking || body.reasoning_effort) {
-        const effort = body.reasoning_effort || "medium";
-        if (!["off", "none", "disabled"].includes(String(effort).toLowerCase())) {
-          // Передаём напрямую в тело запроса
-          nimRequest.thinking = true;
-          nimRequest.reasoning_effort = effort;
-        }
-      }
 
       try {
         const response = await fetch(`${API_BASE}/chat/completions`, {
@@ -110,6 +77,24 @@ export default {
           body: JSON.stringify(nimRequest),
         });
 
+        // 🔥 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Перехват ошибок от NVIDIA (422, 400, 500 и т.д.)
+        // Если ответ НЕ успешный, мы читаем его как текст/JSON и возвращаем клиенту четко.
+        // Это предотвращает зависание клиента при попытке стримить ошибку.
+        if (!response.ok) {
+          const errorText = await response.text();
+          let errorData;
+          try {
+            errorData = JSON.parse(errorText);
+          } catch (e) {
+            errorData = { error: { message: errorText.substring(0, 300) } };
+          }
+          return new Response(JSON.stringify(errorData), {
+            status: response.status,
+            headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+          });
+        }
+
+        // Если ответ успешный (200 OK), работаем как обычно
         const responseHeaders = {
           "Content-Type": body.stream ? "text/event-stream" : "application/json",
           "Cache-Control": "no-cache",
@@ -118,20 +103,19 @@ export default {
         if (body.stream) responseHeaders["Connection"] = "keep-alive";
 
         if (body.stream) {
-          return new Response(response.body, { status: response.status, headers: responseHeaders });
+          return new Response(response.body, { status: 200, headers: responseHeaders });
         }
 
         const data = await response.json();
-        return new Response(JSON.stringify(data), { status: response.status, headers: responseHeaders });
+        return new Response(JSON.stringify(data), { status: 200, headers: responseHeaders });
         
       } catch (err) {
-        return new Response(JSON.stringify({ error: "Upstream error: " + err.message }), {
+        return new Response(JSON.stringify({ error: "Network error to upstream: " + err.message }), {
           status: 502, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
         });
       }
     }
 
-    // 7. 404 для всего остального
     return new Response(JSON.stringify({ error: "Not Found: " + pathname }), {
       status: 404, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
     });
