@@ -13,7 +13,7 @@ export default {
         headers: {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Authorization, Content-Type, x-st-override",
+          "Access-Control-Allow-Headers": "Authorization, Content-Type",
         },
       });
     }
@@ -29,7 +29,7 @@ export default {
 
     // 3. Проверка ключей
     if (!BACKEND_API_KEY || !CLIENT_API_KEY) {
-      return new Response(JSON.stringify({ error: "Server config error: Keys missing in Cloudflare Variables" }), {
+      return new Response(JSON.stringify({ error: "Server config error: Keys missing" }), {
         status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
       });
     }
@@ -64,7 +64,7 @@ export default {
         messages: body.messages,
         temperature: body.temperature !== undefined ? body.temperature : 0.7,
         max_tokens: body.max_tokens || 1024,
-        stream: body.stream !== undefined ? body.stream : true,
+        stream: body.stream !== undefined ? body.stream : false, // По умолчанию БЕЗ стриминга
       };
 
       try {
@@ -77,9 +77,7 @@ export default {
           body: JSON.stringify(nimRequest),
         });
 
-        // 🔥 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Перехват ошибок от NVIDIA (422, 400, 500 и т.д.)
-        // Если ответ НЕ успешный, мы читаем его как текст/JSON и возвращаем клиенту четко.
-        // Это предотвращает зависание клиента при попытке стримить ошибку.
+        // Обработка ошибок от NVIDIA
         if (!response.ok) {
           const errorText = await response.text();
           let errorData;
@@ -94,20 +92,98 @@ export default {
           });
         }
 
-        // Если ответ успешный (200 OK), работаем как обычно
-        const responseHeaders = {
-          "Content-Type": body.stream ? "text/event-stream" : "application/json",
-          "Cache-Control": "no-cache",
-          "Access-Control-Allow-Origin": "*",
-        };
-        if (body.stream) responseHeaders["Connection"] = "keep-alive";
-
+        // 🔥 УМНАЯ ОБРАБОТКА СТРИМИНГА
         if (body.stream) {
-          return new Response(response.body, { status: 200, headers: responseHeaders });
-        }
+          // Если клиент хочет стриминг - пробрасываем поток напрямую
+          return new Response(response.body, {
+            status: 200,
+            headers: {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              "Connection": "keep-alive",
+              "Access-Control-Allow-Origin": "*",
+            },
+          });
+        } else {
+          // Если клиент НЕ хочет стриминг - собираем SSE-поток и возвращаем финальный JSON
+          const responseText = await response.text();
+          
+          // Парсим SSE-поток
+          const lines = responseText.split('\n').filter(line => line.trim() !== '');
+          let finalContent = '';
+          let finalResponse = null;
 
-        const data = await response.json();
-        return new Response(JSON.stringify(data), { status: 200, headers: responseHeaders });
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6).trim();
+              
+              if (data === '[DONE]') {
+                break;
+              }
+
+              try {
+                const chunk = JSON.parse(data);
+                
+                // Собираем контент из всех chunks
+                if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta) {
+                  const delta = chunk.choices[0].delta;
+                  if (delta.content) {
+                    finalContent += delta.content;
+                  }
+                }
+
+                // Сохраняем последний chunk для метаданных
+                if (chunk.id) {
+                  finalResponse = chunk;
+                }
+              } catch (e) {
+                // Пропускаем невалидный JSON
+              }
+            }
+          }
+
+          // Формируем финальный ответ в формате OpenAI
+          if (finalResponse) {
+            finalResponse.choices = [{
+              index: 0,
+              message: {
+                role: 'assistant',
+                content: finalContent
+              },
+              finish_reason: 'stop'
+            }];
+            finalResponse.object = 'chat.completion';
+          } else {
+            // Если не удалось распарсить, возвращаем минимальный ответ
+            finalResponse = {
+              id: `chatcmpl-${Date.now()}`,
+              object: 'chat.completion',
+              created: Math.floor(Date.now() / 1000),
+              model: body.model,
+              choices: [{
+                index: 0,
+                message: {
+                  role: 'assistant',
+                  content: finalContent || 'No response generated'
+                },
+                finish_reason: 'stop'
+              }],
+              usage: {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0
+              }
+            };
+          }
+
+          return new Response(JSON.stringify(finalResponse), {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+              "Access-Control-Allow-Origin": "*"
+            }
+          });
+        }
         
       } catch (err) {
         return new Response(JSON.stringify({ error: "Network error to upstream: " + err.message }), {
