@@ -2,5 +2,9 @@ name = "nimjan"
 main = "worker.js"
 compatibility_date = "2026-01-01"
 
-[vars]
-# Переменные добавляются через Cloudflare Dashboard, не здесь
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
