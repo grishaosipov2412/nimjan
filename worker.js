@@ -22,25 +22,18 @@ export default {
     if (pathname === "/health" && request.method === "GET") {
       return new Response(JSON.stringify({
         status: "ok",
-        service: "CF Worker Proxy",
-        supported_efforts: ["minimal", "low", "medium", "high", "extra-high", "max"],
-        config: { BACKEND_API_KEY_set: !!BACKEND_API_KEY, CLIENT_API_KEY_set: !!CLIENT_API_KEY }
-      }), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+        service: "CF Worker Proxy"
+      }), { headers: { "Content-Type": "application/json" } });
     }
 
     // Проверка ключей
     if (!BACKEND_API_KEY || !CLIENT_API_KEY) {
-      return new Response(JSON.stringify({ error: "Server config error: Keys missing" }), {
-        status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-      });
+      return new Response(JSON.stringify({ error: "Keys missing" }), { status: 500 });
     }
 
-    // Проверка ключа клиента
     const authHeader = request.headers.get("Authorization");
     if (!authHeader || authHeader !== `Bearer ${CLIENT_API_KEY}`) {
-      return new Response(JSON.stringify({ error: "Invalid API key" }), {
-        status: 401, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-      });
+      return new Response(JSON.stringify({ error: "Invalid API key" }), { status: 401 });
     }
 
     // Chat completions
@@ -49,33 +42,20 @@ export default {
       try {
         body = await request.json();
       } catch (e) {
-        return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
-          status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-        });
+        return new Response(JSON.stringify({ error: "Invalid JSON" }), { status: 400 });
       }
 
-      if (!body.model || !body.messages || body.messages.length === 0) {
-        return new Response(JSON.stringify({ error: "Parameter 'model' and non-empty 'messages' are required" }), {
-          status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-        });
+      if (!body.model || !body.messages) {
+        return new Response(JSON.stringify({ error: "Missing model or messages" }), { status: 400 });
       }
 
-      // Запрос к NVIDIA
       const nimRequest = {
         model: body.model,
         messages: body.messages,
-        temperature: body.temperature !== undefined ? body.temperature : 0.7,
+        temperature: body.temperature || 0.7,
         max_tokens: body.max_tokens || 1024,
         stream: body.stream || false,
       };
-
-      if (body.thinking || body.reasoning_effort) {
-        const effort = body.reasoning_effort || "medium";
-        if (!["off", "none", "disabled"].includes(String(effort).toLowerCase())) {
-          nimRequest.thinking = true;
-          nimRequest.reasoning_effort = effort;
-        }
-      }
 
       try {
         const response = await fetch(`${API_BASE}/chat/completions`, {
@@ -90,77 +70,86 @@ export default {
         // Ошибки от NVIDIA
         if (!response.ok) {
           const errorText = await response.text();
-          let errorData;
-          try {
-            errorData = JSON.parse(errorText);
-          } catch (e) {
-            errorData = { error: { message: errorText.substring(0, 300) } };
-          }
+          console.log("NVIDIA ERROR:", response.status, errorText);
           
           if (body.stream) {
-            const errorSSE = `data: ${JSON.stringify(errorData)}\n\ndata: [DONE]\n\n`;
+            const errorSSE = `data: ${JSON.stringify({error: {message: errorText}})}\n\ndata: [DONE]\n\n`;
             return new Response(errorSSE, {
               status: response.status,
+              headers: { "Content-Type": "text/event-stream" }
+            });
+          }
+          return new Response(errorText, { status: response.status, headers: { "Content-Type": "application/json" } });
+        }
+
+        // 🔥 ЛОГИРОВАНИЕ: смотрим что возвращает NVIDIA
+        const responseText = await response.text();
+        console.log("NVIDIA RESPONSE (first 500 chars):", responseText.substring(0, 500));
+        console.log("Client requested stream:", body.stream);
+
+        // Если клиент просил стриминг
+        if (body.stream) {
+          // Проверяем, является ли ответ SSE (начинается с "data: ")
+          if (responseText.startsWith("data: ")) {
+            // Это уже SSE, пробрасываем как есть
+            console.log("Returning SSE stream directly");
+            return new Response(responseText, {
+              status: 200,
               headers: {
                 "Content-Type": "text/event-stream",
                 "Cache-Control": "no-cache",
-                "Access-Control-Allow-Origin": "*"
+                "Connection": "keep-alive"
               }
             });
+          } else {
+            // Это обычный JSON, конвертируем в SSE
+            console.log("Converting JSON to SSE");
+            try {
+              const data = JSON.parse(responseText);
+              const content = data.choices?.[0]?.message?.content || '';
+              const chunk = {
+                id: data.id || "chatcmpl-1",
+                object: "chat.completion.chunk",
+                created: data.created || Math.floor(Date.now() / 1000),
+                model: data.model || body.model,
+                choices: [{
+                  index: 0,
+                  delta: { content: content },
+                  finish_reason: "stop"
+                }]
+              };
+              const sse = `data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`;
+              console.log("SSE response:", sse.substring(0, 200));
+              return new Response(sse, {
+                status: 200,
+                headers: {
+                  "Content-Type": "text/event-stream",
+                  "Cache-Control": "no-cache"
+                }
+              });
+            } catch (e) {
+              console.error("Failed to parse JSON:", e);
+              return new Response(`data: ${JSON.stringify({error: {message: "Failed to parse response"}})}\n\ndata: [DONE]\n\n`, {
+                status: 500,
+                headers: { "Content-Type": "text/event-stream" }
+              });
+            }
           }
-          
-          return new Response(JSON.stringify(errorData), {
-            status: response.status,
-            headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-          });
-        }
-
-        // 🔥 ОПТИМИЗАЦИЯ: нативный стриминг без парсинга
-        if (body.stream) {
-          return new Response(response.body, {
-            status: 200,
-            headers: {
-              "Content-Type": "text/event-stream",
-              "Cache-Control": "no-cache",
-              "Connection": "keep-alive",
-              "Access-Control-Allow-Origin": "*",
-            },
-          });
         }
 
         // Обычный JSON
-        const data = await response.json();
-        return new Response(JSON.stringify(data), {
+        console.log("Returning JSON response");
+        return new Response(responseText, {
           status: 200,
-          headers: {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*"
-          }
+          headers: { "Content-Type": "application/json" }
         });
         
       } catch (err) {
-        const errorResponse = { error: "Network error to upstream: " + err.message };
-        
-        if (body.stream) {
-          const errorSSE = `data: ${JSON.stringify(errorResponse)}\n\ndata: [DONE]\n\n`;
-          return new Response(errorSSE, {
-            status: 502,
-            headers: {
-              "Content-Type": "text/event-stream",
-              "Cache-Control": "no-cache",
-              "Access-Control-Allow-Origin": "*"
-            }
-          });
-        }
-        
-        return new Response(JSON.stringify(errorResponse), {
-          status: 502, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-        });
+        console.error("Network error:", err);
+        return new Response(JSON.stringify({ error: err.message }), { status: 502 });
       }
     }
 
-    return new Response(JSON.stringify({ error: "Not Found: " + pathname }), {
-      status: 404, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-    });
+    return new Response(JSON.stringify({ error: "Not Found" }), { status: 404 });
   },
 };
