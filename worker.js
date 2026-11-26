@@ -26,7 +26,6 @@ export default {
       }), { headers: { "Content-Type": "application/json" } });
     }
 
-    // Проверка ключей
     if (!BACKEND_API_KEY || !CLIENT_API_KEY) {
       return new Response(JSON.stringify({ error: "Keys missing" }), { status: 500 });
     }
@@ -36,7 +35,6 @@ export default {
       return new Response(JSON.stringify({ error: "Invalid API key" }), { status: 401 });
     }
 
-    // Chat completions
     if (pathname === "/v1/chat/completions" && request.method === "POST") {
       let body;
       try {
@@ -54,8 +52,16 @@ export default {
         messages: body.messages,
         temperature: body.temperature || 0.7,
         max_tokens: body.max_tokens || 1024,
-        stream: body.stream || false,
+        stream: true,
       };
+
+      if (body.thinking || body.reasoning_effort) {
+        const effort = body.reasoning_effort || "medium";
+        if (!["off", "none", "disabled"].includes(String(effort).toLowerCase())) {
+          nimRequest.thinking = true;
+          nimRequest.reasoning_effort = effort;
+        }
+      }
 
       try {
         const response = await fetch(`${API_BASE}/chat/completions`, {
@@ -67,86 +73,92 @@ export default {
           body: JSON.stringify(nimRequest),
         });
 
-        // Ошибки от NVIDIA
         if (!response.ok) {
           const errorText = await response.text();
-          console.log("NVIDIA ERROR:", response.status, errorText);
-          
-          if (body.stream) {
-            const errorSSE = `data: ${JSON.stringify({error: {message: errorText}})}\n\ndata: [DONE]\n\n`;
-            return new Response(errorSSE, {
-              status: response.status,
-              headers: { "Content-Type": "text/event-stream" }
-            });
-          }
-          return new Response(errorText, { status: response.status, headers: { "Content-Type": "application/json" } });
+          const errorSSE = `data: ${JSON.stringify({error: {message: errorText}})}\n\ndata: [DONE]\n\n`;
+          return new Response(errorSSE, {
+            status: response.status,
+            headers: { "Content-Type": "text/event-stream" }
+          });
         }
 
-        // 🔥 ЛОГИРОВАНИЕ: смотрим что возвращает NVIDIA
-        const responseText = await response.text();
-        console.log("NVIDIA RESPONSE (first 500 chars):", responseText.substring(0, 500));
-        console.log("Client requested stream:", body.stream);
-
-        // Если клиент просил стриминг
-        if (body.stream) {
-          // Проверяем, является ли ответ SSE (начинается с "data: ")
-          if (responseText.startsWith("data: ")) {
-            // Это уже SSE, пробрасываем как есть
-            console.log("Returning SSE stream directly");
-            return new Response(responseText, {
-              status: 200,
-              headers: {
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive"
-              }
-            });
-          } else {
-            // Это обычный JSON, конвертируем в SSE
-            console.log("Converting JSON to SSE");
+        // 🔥 Читаем SSE от NVIDIA и переупаковываем в формат OpenAI
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        const encoder = new TextEncoder();
+        
+        const stream = new ReadableStream({
+          async start(controller) {
+            let buffer = '';
+            
             try {
-              const data = JSON.parse(responseText);
-              const content = data.choices?.[0]?.message?.content || '';
-              const chunk = {
-                id: data.id || "chatcmpl-1",
-                object: "chat.completion.chunk",
-                created: data.created || Math.floor(Date.now() / 1000),
-                model: data.model || body.model,
-                choices: [{
-                  index: 0,
-                  delta: { content: content },
-                  finish_reason: "stop"
-                }]
-              };
-              const sse = `data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`;
-              console.log("SSE response:", sse.substring(0, 200));
-              return new Response(sse, {
-                status: 200,
-                headers: {
-                  "Content-Type": "text/event-stream",
-                  "Cache-Control": "no-cache"
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop();
+                
+                for (const line of lines) {
+                  const trimmed = line.trim();
+                  if (!trimmed || !trimmed.startsWith('data: ')) continue;
+                  
+                  const data = trimmed.slice(6).trim();
+                  if (data === '[DONE]') {
+                    controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+                    continue;
+                  }
+                  
+                  try {
+                    const chunk = JSON.parse(data);
+                    
+                    // Переупаковываем в стандартный формат OpenAI
+                    const openaiChunk = {
+                      id: chunk.id || `chatcmpl-${Date.now()}`,
+                      object: "chat.completion.chunk",
+                      created: chunk.created || Math.floor(Date.now() / 1000),
+                      model: chunk.model || body.model,
+                      choices: (chunk.choices || []).map(choice => ({
+                        index: choice.index || 0,
+                        delta: {
+                          content: choice.delta?.content || choice.message?.content || ''
+                        },
+                        finish_reason: choice.finish_reason || null
+                      }))
+                    };
+                    
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(openaiChunk)}\n\n`));
+                  } catch (e) {
+                    console.error("Failed to parse chunk:", e);
+                  }
                 }
-              });
+              }
+              controller.close();
             } catch (e) {
-              console.error("Failed to parse JSON:", e);
-              return new Response(`data: ${JSON.stringify({error: {message: "Failed to parse response"}})}\n\ndata: [DONE]\n\n`, {
-                status: 500,
-                headers: { "Content-Type": "text/event-stream" }
-              });
+              console.error("Stream error:", e);
+              controller.close();
             }
           }
-        }
+        });
 
-        // Обычный JSON
-        console.log("Returning JSON response");
-        return new Response(responseText, {
+        return new Response(stream, {
           status: 200,
-          headers: { "Content-Type": "application/json" }
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+          },
         });
         
       } catch (err) {
         console.error("Network error:", err);
-        return new Response(JSON.stringify({ error: err.message }), { status: 502 });
+        const errorSSE = `data: ${JSON.stringify({error: {message: err.message}})}\n\ndata: [DONE]\n\n`;
+        return new Response(errorSSE, {
+          status: 502,
+          headers: { "Content-Type": "text/event-stream" }
+        });
       }
     }
 
