@@ -1,12 +1,9 @@
 {
-  "name": "nim-proxy-worker",
+  "name": "nimjan-proxy",
   "version": "1.0.0",
-  "description": "OpenAI-compatible proxy for NVIDIA NIM API",
+  "description": "Optimized OpenAI-compatible proxy for NVIDIA NIM",
   "main": "worker.js",
   "scripts": {
     "deploy": "wrangler deploy"
-  },
-  "devDependencies": {
-    "wrangler": "^3.0.0"
   }
 }
