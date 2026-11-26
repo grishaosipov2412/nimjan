@@ -24,14 +24,15 @@ export default {
       return new Response(JSON.stringify({
         status: "ok",
         service: "CF Worker Proxy",
-        show_reasoning: SHOW_REASONING,
-        config: { BACKEND_API_KEY_set: !!BACKEND_API_KEY, CLIENT_API_KEY_set: !!CLIENT_API_KEY }
+        show_reasoning: SHOW_REASONING
       }), { headers: { "Content-Type": "application/json" } });
     }
 
     // Models
     if (pathname === "/v1/models" && request.method === "GET") {
-      if (!checkKey(request, CLIENT_API_KEY)) return unauthorized();
+      if (request.headers.get("Authorization") !== `Bearer ${CLIENT_API_KEY}`) {
+        return new Response(JSON.stringify({ error: "Invalid API key" }), { status: 401 });
+      }
       return new Response(JSON.stringify({
         object: "list",
         data: [{ id: "custom-model", object: "model", created: Math.floor(Date.now() / 1000), owned_by: "proxy" }]
@@ -41,9 +42,11 @@ export default {
     // Chat completions
     if (pathname === "/v1/chat/completions" && request.method === "POST") {
       if (!BACKEND_API_KEY || !CLIENT_API_KEY) {
-        return new Response(JSON.stringify({ error: "Server config error: Keys missing" }), { status: 500 });
+        return new Response(JSON.stringify({ error: "Server config error" }), { status: 500 });
       }
-      if (!checkKey(request, CLIENT_API_KEY)) return unauthorized();
+      if (request.headers.get("Authorization") !== `Bearer ${CLIENT_API_KEY}`) {
+        return new Response(JSON.stringify({ error: "Invalid API key" }), { status: 401 });
+      }
 
       let body;
       try {
@@ -56,14 +59,13 @@ export default {
         return new Response(JSON.stringify({ error: "Missing model or messages" }), { status: 400 });
       }
 
-      const wantStream = body.stream !== undefined ? body.stream : true;
-
+      // 🔥 ВСЕГДА запрашиваем stream: false у NVIDIA, чтобы получить полный JSON
       const nimRequest = {
         model: body.model,
         messages: body.messages,
         temperature: body.temperature !== undefined ? body.temperature : 0.7,
         max_tokens: body.max_tokens || 1024,
-        stream: wantStream,
+        stream: false, // Всегда false!
       };
 
       if (body.thinking || body.reasoning_effort) {
@@ -84,151 +86,55 @@ export default {
           body: JSON.stringify(nimRequest),
         });
 
+        // Ошибки от NVIDIA
         if (!response.ok) {
           const errorText = await response.text();
           console.log("NVIDIA ERROR:", response.status, errorText);
-          if (wantStream) {
-            const sse = `data: ${JSON.stringify({ error: { message: errorText } })}\n\ndata: [DONE]\n\n`;
-            return new Response(sse, { status: response.status, headers: { "Content-Type": "text/event-stream" } });
-          }
-          return new Response(errorText, { status: response.status, headers: { "Content-Type": "application/json" } });
-        }
-
-        // === НЕ-СТРИМИНГ: читаем JSON, склеиваем reasoning + content ===
-        if (!wantStream) {
-          const data = await response.json();
-          const choice = data.choices?.[0];
-          if (choice?.message) {
-            const reasoning = choice.message.reasoning_content || "";
-            const content = choice.message.content || "";
-            let final = content;
-            if (SHOW_REASONING && reasoning) {
-              final = `<think>\n${reasoning}\n</think>\n\n${content}`;
-            }
-            choice.message.content = final;
-            delete choice.message.reasoning_content;
-          }
-          return new Response(JSON.stringify(data), {
-            status: 200,
-            headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+          // Возвращаем ошибку в SSE-формате для Janitor AI
+          const errorSSE = `data: ${JSON.stringify({ error: { message: errorText } })}\n\ndata: [DONE]\n\n`;
+          return new Response(errorSSE, {
+            status: response.status,
+            headers: { "Content-Type": "text/event-stream" }
           });
         }
 
-        // === СТРИМИНГ: читаем SSE от NVIDIA и переупаковываем в OpenAI-формат ===
-        // Ключевое исправление: NVIDIA кладёт текст reasoning-моделей в delta.reasoning_content.
-        // Мы переносим его в delta.content, оборачивая в <think>...</think>, чтобы клиент видел текст.
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        const encoder = new TextEncoder();
+        // Получаем полный JSON от NVIDIA
+        const data = await response.json();
+        console.log("NVIDIA RESPONSE:", JSON.stringify(data).substring(0, 500));
 
-        const stream = new ReadableStream({
-          async start(controller) {
-            let buffer = '';
-            let reasoningStarted = false;
-            let reasoningEnded = false;
-            let lastId = `chatcmpl-${Date.now()}`;
-            let lastModel = body.model;
-            let lastCreated = Math.floor(Date.now() / 1000);
-
-            const send = (obj) => {
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
-            };
-
-            try {
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split('\n');
-                buffer = lines.pop();
-
-                for (const line of lines) {
-                  const trimmed = line.trim();
-                  if (!trimmed || !trimmed.startsWith('data:')) continue;
-
-                  const data = trimmed.slice(5).trim();
-                  if (data === '[DONE]') {
-                    // Закрываем <think>, если reasoning остался незакрытым
-                    if (SHOW_REASONING && reasoningStarted && !reasoningEnded) {
-                      send({
-                        id: lastId, object: "chat.completion.chunk", created: lastCreated, model: lastModel,
-                        choices: [{ index: 0, delta: { content: "\n</think>\n\n" }, finish_reason: null }]
-                      });
-                    }
-                    controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-                    continue;
-                  }
-
-                  let chunk;
-                  try {
-                    chunk = JSON.parse(data);
-                  } catch (e) {
-                    console.error("Bad chunk:", data.substring(0, 100));
-                    continue;
-                  }
-
-                  if (chunk.id) lastId = chunk.id;
-                  if (chunk.model) lastModel = chunk.model;
-                  if (chunk.created) lastCreated = chunk.created;
-
-                  const choice = chunk.choices?.[0];
-                  if (!choice) continue;
-
-                  const delta = choice.delta || {};
-                  const reasoning = delta.reasoning_content || "";
-                  const content = delta.content || "";
-
-                  // Собираем текст в delta.content для OpenAI-формата
-                  let outContent = "";
-
-                  if (SHOW_REASONING) {
-                    if (reasoning) {
-                      if (!reasoningStarted) {
-                        outContent += "<think>\n" + reasoning;
-                        reasoningStarted = true;
-                      } else {
-                        outContent += reasoning;
-                      }
-                    }
-                    if (content) {
-                      if (reasoningStarted && !reasoningEnded) {
-                        outContent += "\n</think>\n\n" + content;
-                        reasoningEnded = true;
-                      } else {
-                        outContent += content;
-                      }
-                    }
-                  } else {
-                    // Без показа reasoning: просто отдаём content, reasoning игнорируем
-                    outContent = content;
-                  }
-
-                  // Если ничего нет и finish_reason тоже нет — пропускаем пустой чанк
-                  if (!outContent && !choice.finish_reason) continue;
-
-                  send({
-                    id: lastId,
-                    object: "chat.completion.chunk",
-                    created: lastCreated,
-                    model: lastModel,
-                    choices: [{
-                      index: 0,
-                      delta: { content: outContent },
-                      finish_reason: choice.finish_reason || null
-                    }]
-                  });
-                }
-              }
-              controller.close();
-            } catch (e) {
-              console.error("Stream error:", e);
-              controller.close();
-            }
+        // Извлекаем content и reasoning_content
+        const choice = data.choices?.[0];
+        let finalContent = "";
+        
+        if (choice?.message) {
+          const reasoning = choice.message.reasoning_content || "";
+          const content = choice.message.content || "";
+          
+          if (SHOW_REASONING && reasoning) {
+            finalContent = `<think>\n${reasoning}\n</think>\n\n${content}`;
+          } else {
+            finalContent = content;
           }
-        });
+        }
 
-        return new Response(stream, {
+        console.log("Final content length:", finalContent.length);
+
+        // 🔥 Конвертируем в SSE-формат для Janitor AI
+        const chunk = {
+          id: data.id || `chatcmpl-${Date.now()}`,
+          object: "chat.completion.chunk",
+          created: data.created || Math.floor(Date.now() / 1000),
+          model: data.model || body.model,
+          choices: [{
+            index: 0,
+            delta: { content: finalContent },
+            finish_reason: choice?.finish_reason || "stop"
+          }]
+        };
+
+        const sseResponse = `data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`;
+        
+        return new Response(sseResponse, {
           status: 200,
           headers: {
             "Content-Type": "text/event-stream",
@@ -240,25 +146,14 @@ export default {
 
       } catch (err) {
         console.error("Network error:", err);
-        if (wantStream) {
-          const sse = `data: ${JSON.stringify({ error: { message: err.message } })}\n\ndata: [DONE]\n\n`;
-          return new Response(sse, { status: 502, headers: { "Content-Type": "text/event-stream" } });
-        }
-        return new Response(JSON.stringify({ error: err.message }), { status: 502 });
+        const errorSSE = `data: ${JSON.stringify({ error: { message: err.message } })}\n\ndata: [DONE]\n\n`;
+        return new Response(errorSSE, {
+          status: 502,
+          headers: { "Content-Type": "text/event-stream" }
+        });
       }
     }
 
     return new Response(JSON.stringify({ error: "Not Found" }), { status: 404 });
   },
 };
-
-function checkKey(request, clientKey) {
-  const auth = request.headers.get("Authorization");
-  return auth === `Bearer ${clientKey}`;
-}
-
-function unauthorized() {
-  return new Response(JSON.stringify({ error: "Invalid API key" }), {
-    status: 401, headers: { "Content-Type": "application/json" }
-  });
-}
